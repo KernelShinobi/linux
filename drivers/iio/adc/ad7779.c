@@ -300,9 +300,9 @@ static int ad7779_set_sampling_frequency(struct ad7779_state *st,
 		 * division, then the original division result is subtracted and
 		 * the number is divided by 10^3.
 		 */
-		decimal = ((mult_frac(div, KILO, freq_khz) - dec * KILO) << 16)
-			  / KILO;
-		ret = ad7779_spi_write(st, AD7779_REG_SRC_N_MSB,
+		int temp = (div * KILO) / freq_khz;
+		decimal = ((temp - dec * KILO) << 16) / KILO;
+		ret = ad7779_spi_write(st, AD7779_REG_SRC_IF_MSB,
 				       FIELD_GET(AD7779_FREQ_MSB_MSK, decimal));
 		if (ret)
 			return ret;
@@ -337,6 +337,59 @@ static int ad7779_set_sampling_frequency(struct ad7779_state *st,
 	st->sampling_freq = sampling_freq;
 
 	return 0;
+}
+
+static int ad7779_set_data_lines(struct iio_dev *indio_dev,
+				 struct iio_chan_spec const *chan,
+				 unsigned int mode)
+{
+	struct ad7779_state *st = iio_priv(indio_dev);
+	int ret;
+
+
+	ret = ad7779_spi_write_mask(st, AD7779_REG_DOUT_FORMAT,
+				    AD7779_DOUT_FORMAT_MSK,
+				    FIELD_PREP(AD7779_DOUT_FORMAT_MSK, mode));
+	switch (mode) {
+	case AD7779_4LINES:
+		ret = ad7779_set_sampling_frequency(st, AD7779_DEFAULT_SAMPLING_FREQ);
+		if (ret)
+			return ret;
+		ret = iio_backend_set_num_lanes(st->back, 4);
+		break;
+	case AD7779_2LINES:
+		ret = ad7779_set_sampling_frequency(st, AD7779_DEFAULT_SAMPLING_2LINE);
+		if (ret)
+			return ret;
+		ret = iio_backend_set_num_lanes(st->back, 2);
+		break;
+	case AD7779_1LINE:
+		ret = ad7779_set_sampling_frequency(st, AD7779_DEFAULT_SAMPLING_1LINE);
+		if (ret)
+			return ret;
+		ret = iio_backend_set_num_lanes(st->back, 1);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	st->data_lines = mode;
+
+	return 0;
+}
+
+static int ad7779_get_data_lines(struct iio_dev *indio_dev,
+				 struct iio_chan_spec const *chan)
+{
+	struct ad7779_state *st = iio_priv(indio_dev);
+	u8 temp;
+	int ret;
+
+	ret = ad7779_spi_read(st, AD7779_REG_DOUT_FORMAT, &temp);
+	if (ret)
+		return ret;
+
+	return FIELD_GET(AD7779_DOUT_FORMAT_MSK, temp);
 }
 
 static int ad7779_get_filter(struct iio_dev *indio_dev,
@@ -403,13 +456,10 @@ static int ad7779_set_calibscale(struct ad7779_state *st, int channel, int val)
 {
 	int ret;
 	unsigned int gain;
-	u8 gain_bytes[3];
-
 	/*
 	 * The gain value is relative to 0x555555, which represents a gain of 1
 	 */
-	gain = DIV_ROUND_CLOSEST_ULL((u64)val * 5592405LL, MEGA);
-	put_unaligned_be24(gain, gain_bytes);
+	gain = DIV_ROUND_CLOSEST_ULL(val * 5592405LL, MEGA);
 	ret = ad7779_spi_write(st, AD7779_REG_CH_GAIN_UPPER_BYTE(channel),
 			       gain_bytes[0]);
 	if (ret)
@@ -496,20 +546,7 @@ static int __ad7779_read_raw(struct iio_dev *indio_dev,
 	default:
 		return -EINVAL;
 	}
-}
-
-static int ad7779_read_raw(struct iio_dev *indio_dev,
-			   struct iio_chan_spec const *chan, int *val,
-			   int *val2, long mask)
-{
-	int ret;
-
-	if (!iio_device_claim_direct(indio_dev))
-		return -EBUSY;
-
-	ret = __ad7779_read_raw(indio_dev, chan, val, val2, mask);
-	iio_device_release_direct(indio_dev);
-	return ret;
+	unreachable();
 }
 
 static int __ad7779_write_raw(struct iio_dev *indio_dev,
@@ -529,27 +566,13 @@ static int __ad7779_write_raw(struct iio_dev *indio_dev,
 	default:
 		return -EINVAL;
 	}
-}
-
-static int ad7779_write_raw(struct iio_dev *indio_dev,
-			    struct iio_chan_spec const *chan, int val, int val2,
-			    long mask)
-{
-	int ret;
-
-	if (!iio_device_claim_direct(indio_dev))
-		return -EBUSY;
-
-	ret = __ad7779_write_raw(indio_dev, chan, val, val2, mask);
-	iio_device_release_direct(indio_dev);
-	return ret;
+	unreachable();
 }
 
 static int ad7779_buffer_preenable(struct iio_dev *indio_dev)
 {
 	int ret;
 	struct ad7779_state *st = iio_priv(indio_dev);
-
 	ret = ad7779_spi_write_mask(st,
 				    AD7779_REG_GENERAL_USER_CONFIG_3,
 				    AD7779_MOD_SPI_EN_MSK,
@@ -569,7 +592,6 @@ static int ad7779_buffer_preenable(struct iio_dev *indio_dev)
 static int ad7779_buffer_postdisable(struct iio_dev *indio_dev)
 {
 	struct ad7779_state *st = iio_priv(indio_dev);
-
 	disable_irq(st->spi->irq);
 
 	return ad7779_spi_write(st, AD7779_REG_GENERAL_USER_CONFIG_3,
@@ -636,11 +658,33 @@ static const struct iio_info ad7779_info = {
 	.debugfs_reg_access = &ad7779_reg_access,
 };
 
+static const struct iio_info ad7779_info_data = {
+	.read_raw = ad7779_read_raw,
+	.write_raw = ad7779_write_raw,
+	.debugfs_reg_access = &ad7779_reg_access,
+	.update_scan_mode = &ad7779_update_scan_mode,
+};
+
+
+static const struct iio_enum ad7779_data_lines_enum = {
+	.items = ad7779_data_lines_modes,
+	.num_items = ARRAY_SIZE(ad7779_data_lines_modes),
+	.get = ad7779_get_data_lines,
+	.set = ad7779_set_data_lines,
+};
+
 static const struct iio_enum ad7779_filter_enum = {
 	.items = ad7779_filter_type,
 	.num_items = ARRAY_SIZE(ad7779_filter_type),
 	.get = ad7779_get_filter,
 	.set = ad7779_set_filter,
+};
+
+static const struct iio_chan_spec_ext_info ad7779_ext_info[] = {
+	IIO_ENUM("data_lines", IIO_SHARED_BY_ALL, &ad7779_data_lines_enum),
+	IIO_ENUM_AVAILABLE("data_lines", IIO_SHARED_BY_ALL,
+				  &ad7779_data_lines_enum),
+	{ },
 };
 
 static const struct iio_chan_spec_ext_info ad7779_ext_filter[] = {
@@ -650,7 +694,33 @@ static const struct iio_chan_spec_ext_info ad7779_ext_filter[] = {
 	{ }
 };
 
-#define AD777x_CHAN_S(index, _ext_info)					\
+static const struct iio_chan_spec_ext_info ad7779_ext_info_filter[] = {
+	IIO_ENUM("data_lines", IIO_SHARED_BY_ALL, &ad7779_data_lines_enum),
+	IIO_ENUM_AVAILABLE("data_lines", IIO_SHARED_BY_ALL,
+				  &ad7779_data_lines_enum),
+	IIO_ENUM("filter_type", IIO_SHARED_BY_ALL, &ad7779_filter_enum),
+	IIO_ENUM_AVAILABLE("filter_type", IIO_SHARED_BY_ALL,
+				  &ad7779_filter_enum),
+	{ }
+};
+
+#define AD7779_CHAN(index, _ext_info)					       \
+	{								       \
+		.type = IIO_VOLTAGE,					       \
+		.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),       \
+		.address = (index),					       \
+		.indexed = 1,						       \
+		.channel = (index),					       \
+		.scan_index = (index),					       \
+		.ext_info = (_ext_info),				       \
+		.scan_type = {						       \
+			.sign = 's',					       \
+			.realbits = 24,					       \
+			.storagebits = 32,				       \
+		},							       \
+	}
+
+#define AD7779_CHAN_S(index, _ext_info)					\
 	{								\
 		.type = IIO_VOLTAGE,					\
 		.info_mask_separate = BIT(IIO_CHAN_INFO_CALIBSCALE)  |	\
@@ -665,15 +735,20 @@ static const struct iio_chan_spec_ext_info ad7779_ext_filter[] = {
 			.sign = 's',					\
 			.realbits = 24,					\
 			.storagebits = 32,				\
-			.endianness = IIO_BE,				\
+			.endianness = IIO_BE,			\
 		},							\
 	}
 
 #define AD777x_CHAN_NO_FILTER_S(index)					\
 	AD777x_CHAN_S(index, NULL)
 
-#define AD777x_CHAN_FILTER_S(index)					\
-	AD777x_CHAN_S(index, ad7779_ext_filter)
+#define AD7779_CHAN_FILTER(index)					       \
+	AD7779_CHAN(index, ad7779_ext_info_filter)
+
+#define AD7779_CHAN_FILTER_S(index)					\
+	AD7779_CHAN_S(index, ad7779_ext_filter)
+
+
 static const struct iio_chan_spec ad7779_channels[] = {
 	AD777x_CHAN_NO_FILTER_S(0),
 	AD777x_CHAN_NO_FILTER_S(1),
@@ -686,6 +761,17 @@ static const struct iio_chan_spec ad7779_channels[] = {
 	IIO_CHAN_SOFT_TIMESTAMP(8),
 };
 
+static const struct iio_chan_spec ad7779_channels_data[] = {
+	AD7779_CHAN_NO_FILTER(0),
+	AD7779_CHAN_NO_FILTER(1),
+	AD7779_CHAN_NO_FILTER(2),
+	AD7779_CHAN_NO_FILTER(3),
+	AD7779_CHAN_NO_FILTER(4),
+	AD7779_CHAN_NO_FILTER(5),
+	AD7779_CHAN_NO_FILTER(6),
+	AD7779_CHAN_NO_FILTER(7),
+};
+
 static const struct iio_chan_spec ad7779_channels_filter[] = {
 	AD777x_CHAN_FILTER_S(0),
 	AD777x_CHAN_FILTER_S(1),
@@ -696,6 +782,17 @@ static const struct iio_chan_spec ad7779_channels_filter[] = {
 	AD777x_CHAN_FILTER_S(6),
 	AD777x_CHAN_FILTER_S(7),
 	IIO_CHAN_SOFT_TIMESTAMP(8),
+};
+
+static const struct iio_chan_spec ad7779_channels_filter_data[] = {
+	AD7779_CHAN_FILTER(0),
+	AD7779_CHAN_FILTER(1),
+	AD7779_CHAN_FILTER(2),
+	AD7779_CHAN_FILTER(3),
+	AD7779_CHAN_FILTER(4),
+	AD7779_CHAN_FILTER(5),
+	AD7779_CHAN_FILTER(6),
+	AD7779_CHAN_FILTER(7),
 };
 
 static const struct iio_buffer_setup_ops ad7779_buffer_setup_ops = {
@@ -752,6 +849,94 @@ static int ad7779_conf(struct ad7779_state *st, struct gpio_desc *start_gpio)
 	return 0;
 }
 
+static int ad7779_register_irq(struct ad7779_state *st, struct iio_dev *indio_dev){
+
+	int ret;
+	struct device *dev = &st->spi->dev;
+
+	indio_dev->info = &ad7779_info;
+	indio_dev->channels = st->chip_info->channels;
+	indio_dev->num_channels = ARRAY_SIZE(ad7779_channels);
+
+	st->trig = devm_iio_trigger_alloc(dev, "%s-dev%d", indio_dev->name,
+					  iio_device_id(indio_dev));
+	if (!st->trig)
+		return -ENOMEM;
+
+	st->trig->ops = &ad7779_trigger_ops;
+
+	iio_trigger_set_drvdata(st->trig, st);
+
+	ret = devm_request_irq(dev, st->spi->irq, iio_trigger_generic_data_rdy_poll,
+			       IRQF_ONESHOT | IRQF_NO_AUTOEN, indio_dev->name,
+			       st->trig);
+	if (ret)
+		return dev_err_probe(dev, ret, "request IRQ %d failed\n",
+				     st->spi->irq);
+
+	ret = devm_iio_trigger_register(dev, st->trig);
+	if (ret)
+		return ret;
+
+	indio_dev->trig = iio_trigger_get(st->trig);
+
+	init_completion(&st->completion);
+
+	ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
+					      &iio_pollfunc_store_time,
+					      &ad7779_trigger_handler,
+					      &ad7779_buffer_setup_ops);
+	if (ret)
+		return ret;
+
+	ret = ad7779_spi_write_mask(st, AD7779_REG_DOUT_FORMAT,
+				    AD7779_DCLK_CLK_DIV_MSK,
+				    FIELD_PREP(AD7779_DCLK_CLK_DIV_MSK, 7));
+	if (ret)
+		return ret;
+	
+	st->spidata_mode = 1;
+
+	return devm_iio_device_register(dev, indio_dev);
+}
+
+static int ad7779_register_back(struct ad7779_state *st, struct iio_dev *indio_dev){
+
+	int ret;
+	struct device *dev = &st->spi->dev;
+
+	indio_dev->info = &ad7779_info_data;
+
+	if (strcmp(st->chip_info->name, "ad7771") == 0){
+		indio_dev->channels = ad7779_channels_filter_data;
+		indio_dev->num_channels = ARRAY_SIZE(ad7779_channels_filter_data);
+	}
+	else{
+		indio_dev->channels = ad7779_channels_data;
+		indio_dev->num_channels = ARRAY_SIZE(ad7779_channels_data);
+	}
+
+	st->back = devm_iio_backend_get(dev, NULL);
+	if (IS_ERR(st->back))
+		return PTR_ERR(st->back);
+
+	ret = devm_iio_backend_request_buffer(dev, st->back, indio_dev);
+	if (ret)
+		return ret;
+
+	ret = devm_iio_backend_enable(dev, st->back);
+	if (ret)
+		return ret;
+
+	ret = iio_backend_set_num_lanes(st->back, 4);
+	if (ret)
+		return ret;
+
+	st->spidata_mode = 0;
+
+	return devm_iio_device_register(dev, indio_dev);
+}
+
 static int ad7779_probe(struct spi_device *spi)
 {
 	struct iio_dev *indio_dev;
@@ -759,9 +944,6 @@ static int ad7779_probe(struct spi_device *spi)
 	struct gpio_desc *reset_gpio, *start_gpio;
 	struct device *dev = &spi->dev;
 	int ret = -EINVAL;
-
-	if (!spi->irq)
-		return dev_err_probe(dev, ret, "DRDY irq not present\n");
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*st));
 	if (!indio_dev)
@@ -804,49 +986,14 @@ static int ad7779_probe(struct spi_device *spi)
 		return ret;
 
 	indio_dev->name = st->chip_info->name;
-	indio_dev->info = &ad7779_info;
-	indio_dev->modes = INDIO_DIRECT_MODE;
-	indio_dev->channels = st->chip_info->channels;
-	indio_dev->num_channels = ARRAY_SIZE(ad7779_channels);
+	indio_dev->modes = INDIO_DIRECT_MODE | INDIO_BUFFER_HARDWARE;	
 
-	st->trig = devm_iio_trigger_alloc(dev, "%s-dev%d", indio_dev->name,
-					  iio_device_id(indio_dev));
-	if (!st->trig)
-		return -ENOMEM;
-
-	st->trig->ops = &ad7779_trigger_ops;
-
-	iio_trigger_set_drvdata(st->trig, st);
-
-	ret = devm_request_irq(dev, spi->irq, iio_trigger_generic_data_rdy_poll,
-			       IRQF_ONESHOT | IRQF_NO_AUTOEN, indio_dev->name,
-			       st->trig);
-	if (ret)
-		return dev_err_probe(dev, ret, "request IRQ %d failed\n",
-				     st->spi->irq);
-
-	ret = devm_iio_trigger_register(dev, st->trig);
-	if (ret)
-		return ret;
-
-	indio_dev->trig = iio_trigger_get(st->trig);
-
-	init_completion(&st->completion);
-
-	ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
-					      &iio_pollfunc_store_time,
-					      &ad7779_trigger_handler,
-					      &ad7779_buffer_setup_ops);
-	if (ret)
-		return ret;
-
-	ret = ad7779_spi_write_mask(st, AD7779_REG_DOUT_FORMAT,
-				    AD7779_DCLK_CLK_DIV_MSK,
-				    FIELD_PREP(AD7779_DCLK_CLK_DIV_MSK, 7));
-	if (ret)
-		return ret;
-
-	return devm_iio_device_register(dev, indio_dev);
+	if(spi->irq){
+		return ad7779_register_irq(st, indio_dev);
+	}
+	else{
+		return ad7779_register_back(st, indio_dev);
+	}
 }
 
 static int ad7779_suspend(struct device *dev)
